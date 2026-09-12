@@ -196,6 +196,13 @@
       <div><label for="s-lat">Breite °</label><input type="number" id="s-lat" step="0.0001" /></div>
       <div><label for="s-lon">Länge °</label><input type="number" id="s-lon" step="0.0001" /></div>
       <div><label>&nbsp;</label><button id="geo-btn" style="width:100%">📍 Meinen Standort verwenden</button></div>
+      <div><label for="s-tz">Zeitzone der Anzeige</label>
+        <select id="s-tz">
+          <option value="auto">Automatisch (vom Standort)</option>
+          <option value="device">Zeitzone des Geräts</option>
+          <option value="Europe/Berlin">Europe/Berlin</option>
+          <option value="UTC">UTC</option>
+        </select></div>
     </div>
     <h2 style="margin-top:16px">Gute Bedingungen</h2>
     <div class="set-grid">
@@ -216,7 +223,8 @@
       Objekte gelten als beobachtbar, wenn sie hoch genug stehen, der Himmel dunkel genug für ihre Helligkeit ist
       (Venus schon in heller Dämmerung, Neptun erst bei Sonne unter ca. −16°), mind. 15° Abstand zur Sonne haben und – bei lichtschwachen
       Objekten – weit genug vom Mond entfernt sind (je voller der Mond, desto mehr). Der Mond braucht mind. 5 % Beleuchtung.
-      Wetter: Open-Meteo, stündlich, bis 16 Tage.
+      Wetter: Open-Meteo, stündlich, bis 16 Tage. Alle Zeiten werden in der Zeitzone des Beobachtungsorts angezeigt
+      (von Open-Meteo ermittelt und gespeichert), unabhängig davon, wie die Systemuhr des Geräts eingestellt ist.
     </p>
   </div>
 
@@ -521,10 +529,17 @@ const phaseOf = alt => PHASES.find(p => alt >= p.min);
 const DEF = {
   lat: 48.1372, lon: 11.5756,
   maxCloud: 30, maxProb: 20, maxPrecip: 0.1,
-  minGood: 60, darkLimit: -12, minAlt: 10, moonCounts: true,
+  minGood: 60, darkLimit: -12, minAlt: 10, moonCounts: true, tz: 'auto',
 };
 
-const K = { S: Object.assign({}, DEF), OBS: null, WX: null, cache: new Map() };
+const K = { S: Object.assign({}, DEF), OBS: null, WX: null, TZ: null, cache: new Map() };
+/* Zeitzone setzen (IANA-Name oder null = Gerät); true, wenn sie sich geändert hat */
+function setTZ(tz) {
+  if (tz === K.TZ) return false;
+  try { new Intl.DateTimeFormat('en-US', { timeZone: tz || undefined }); } catch (e) { return false; }
+  K.TZ = tz || null; _fmt = null; K.cache.clear();
+  return true;
+}
 function setSettings(s) {
   const locChanged = !K.OBS || s.lat !== K.S.lat || s.lon !== K.S.lon;
   K.S = Object.assign({}, DEF, s);
@@ -532,11 +547,60 @@ function setSettings(s) {
   return locChanged;
 }
 
-/* ---------- Datum-Helfer (lokale Zeit) ---------- */
+/* ---------- Datum-Helfer (Zeitzone des Beobachtungsorts) ----------
+   Alle Zeiten werden in K.TZ dargestellt (IANA-Name, null = Zeitzone des Geräts).
+   Damit hängt der Kalender nicht von der Systemzeitzone des Rechners ab. */
 const pad2 = n => String(n).padStart(2, '0');
-const keyOf = d => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
-const dateOf = k => { const [y, m, d] = k.split('-').map(Number); return new Date(y, m - 1, d); };
-const addDays = (k, n) => { const d = dateOf(k); d.setDate(d.getDate() + n); return keyOf(d); };
+let _fmt = null, _fmtTz = '\u0000';
+function tzFmt() {
+  if (_fmt && _fmtTz === K.TZ) return _fmt;
+  _fmtTz = K.TZ;
+  _fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: K.TZ || undefined, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  return _fmt;
+}
+function tzParts(t) {
+  const p = {};
+  for (const x of tzFmt().formatToParts(new Date(t))) if (x.type !== 'literal') p[x.type] = +x.value;
+  if (p.hour === 24) p.hour = 0;
+  return p;
+}
+/* Versatz der Zeitzone zum Zeitpunkt t (ms) */
+function tzOffset(t) {
+  const p = tzParts(t);
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - Math.floor(t / 1000) * 1000;
+}
+const keyOfT = t => { const p = tzParts(t); return `${p.year}-${pad2(p.month)}-${pad2(p.day)}`; };
+/* Zeitstempel einer Wanduhrzeit am Tag k */
+function tsOf(k, h = 0, mi = 0) {
+  const [y, m, d] = k.split('-').map(Number);
+  const wall = Date.UTC(y, m - 1, d, h, mi);
+  let t = wall - tzOffset(wall);
+  t = wall - tzOffset(t);
+  return t;
+}
+const addDays = (k, n) => {
+  const [y, m, d] = k.split('-').map(Number), t = new Date(Date.UTC(y, m - 1, d + n));
+  return `${t.getUTCFullYear()}-${pad2(t.getUTCMonth() + 1)}-${pad2(t.getUTCDate())}`;
+};
+const hourIn = t => tzParts(t).hour;
+/* volle Stunden (Wanduhr) zwischen start und end – inkl. Zeitumstellung */
+function hourTicks(start, end) {
+  const res = [], p = tzParts(start);
+  let t = start + ((60 - p.minute) % 60) * 60000 - p.second * 1000;
+  for (let i = 0; i < 60 && t <= end; i++) {
+    const q = tzParts(t);
+    if (q.minute !== 0 || q.second !== 0) {              // Sprung durch Zeitumstellung
+      t += ((60 - q.minute) % 60) * 60000 - q.second * 1000;
+      if (t > end) break;
+    }
+    if (t >= start) res.push(t);
+    t += HOUR;
+  }
+  return res;
+}
 const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
 
 /* ---------- Geometrie ---------- */
@@ -609,14 +673,14 @@ function snapshot(t, ill, full) {
 /* ---------- Nacht (astronomischer Teil, gecacht) ---------- */
 function computeNight(k) {
   if (K.cache.has(k)) return K.cache.get(k);
-  const d0 = dateOf(k), O = K.OBS;
-  const noon = new Date(d0.getFullYear(), d0.getMonth(), d0.getDate(), 12);
+  const O = K.OBS;
+  const noon = new Date(tsOf(k, 12));
   const set = A.SearchRiseSet('Sun', O, -1, noon, 1);
   const rise = set ? A.SearchRiseSet('Sun', O, +1, set.date, 1) : null;
   const sunset = set ? set.date.getTime() : null, sunrise = rise ? rise.date.getTime() : null;
   let start, end;
   if (sunset && sunrise) { start = sunset - PAD; end = sunrise + PAD; }
-  else { start = new Date(d0.getFullYear(), d0.getMonth(), d0.getDate(), 18).getTime(); end = start + 12 * HOUR; }
+  else { start = tsOf(k, 18); end = start + 12 * HOUR; }
   start = Math.floor(start / STEP) * STEP; end = Math.ceil(end / STEP) * STEP;
 
   const tw = {};
@@ -643,7 +707,7 @@ function computeNight(k) {
 function setWeather(data) {
   const h = data.hourly, idx = new Map();
   h.time.forEach((s, i) => idx.set(Math.round(s * 1000 / HOUR), i));
-  K.WX = { idx, cloud: h.cloud_cover, low: h.cloud_cover_low, mid: h.cloud_cover_mid, high: h.cloud_cover_high,
+  K.WX = { idx, t0: h.time[0] * 1000, cloud: h.cloud_cover, low: h.cloud_cover_low, mid: h.cloud_cover_mid, high: h.cloud_cover_high,
     precip: h.precipitation, prob: h.precipitation_probability, temp: h.temperature_2m,
     rh: h.relative_humidity_2m, wind: h.wind_speed_10m,
     first: h.time[0] * 1000, last: h.time[h.time.length - 1] * 1000 };
@@ -735,11 +799,11 @@ function fmtDur(min) {
 
 /* Nacht, zu der „jetzt“ gehört: laufende Nacht, sonst die kommende */
 function currentNightKey(now = Date.now()) {
-  const today = keyOf(new Date(now)), y = addDays(today, -1);
+  const today = keyOfT(now), y = addDays(today, -1);
   return computeNight(y).end > now ? y : today;
 }
 
-if (typeof module !== 'undefined') module.exports = { K, setSettings, computeNight, evalNight, setWeather, wxAt, snapshot, illumAll, currentNightKey, BODIES, PHASES, phaseOf, keyOf, addDays, limbRotation };
+if (typeof module !== 'undefined') module.exports = { K, setSettings, setTZ, tsOf, keyOfT, tzParts, tzOffset, hourIn, hourTicks, computeNight, evalNight, setWeather, wxAt, snapshot, illumAll, currentNightKey, BODIES, PHASES, phaseOf, addDays, limbRotation };
 
 /* ===== Beobachtungskalender – Oberfläche ===== */
 const $ = (s, el = document) => el.querySelector(s);
@@ -751,9 +815,10 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;',
 
 /* ---------- Formatierung ---------- */
 const fNum = (x, d = 0) => x == null || isNaN(x) ? '–' : x.toLocaleString('de-DE', { minimumFractionDigits: d, maximumFractionDigits: d });
-const fTime = t => t == null ? '–' : new Date(t).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
-const fDay = k => dateOf(k).toLocaleDateString('de-DE', { weekday: 'short', day: '2-digit', month: '2-digit' });
-const fWhen = t => new Date(t).toLocaleDateString('de-DE', { weekday: 'short', day: '2-digit', month: '2-digit' }) + ' · ' + fTime(t) + ' Uhr';
+const tzOpt = () => K.TZ || undefined;
+const fTime = t => t == null ? '–' : new Date(t).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit', timeZone: tzOpt() });
+const fDay = k => { const [y, m, d] = k.split('-').map(Number); return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString('de-DE', { weekday: 'short', day: '2-digit', month: '2-digit', timeZone: 'UTC' }); };
+const fWhen = t => new Date(t).toLocaleDateString('de-DE', { weekday: 'short', day: '2-digit', month: '2-digit', timeZone: tzOpt() }) + ' · ' + fTime(t) + ' Uhr';
 const COMPASS = ['N', 'NNO', 'NO', 'ONO', 'O', 'OSO', 'SO', 'SSO', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
 const fAz = az => `${fNum(az)}° ${COMPASS[Math.round(az / 22.5) % 16]}`;
 const fDeg = (x, d = 1) => `${fNum(x, d)}°`;
@@ -779,6 +844,28 @@ const PPROB_STOPS = [[0, '#121922'], [20, '#1d3a52'], [50, '#2a7ca6'], [80, '#3c
 const cloudColor = scale(CLOUD_STOPS), pAmtColor = scale(PAMT_STOPS), pProbColor = scale(PPROB_STOPS);
 const gradCSS = stops => { const a = stops[0][0], b = stops[stops.length - 1][0]; return `linear-gradient(90deg, ${stops.map(([v, c]) => `${c} ${((v - a) / (b - a) * 100).toFixed(0)}%`).join(',')})`; };
 const COL = { good: '#6fd88a', bad: '#8a3a47', unknown: '#3a4350', grey: '#3a4350', nodata: '#161c25' };
+
+/* ---------- Zeitzone ---------- */
+const deviceTZ = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch (e) { return 'UTC'; } };
+let locTZ = null;                              // vom Standort (Open-Meteo)
+const locKey = () => `${K.S.lat.toFixed(3)},${K.S.lon.toFixed(3)}`;
+function wantedTZ() {
+  const t = K.S.tz;
+  if (t === 'device') return null;
+  if (t && t !== 'auto') return t;
+  return locTZ || null;                        // ohne Wissen: Gerät
+}
+const applyTZ = () => setTZ(wantedTZ());
+async function loadTZ(force) {
+  const key = locKey(), c = LS.get('bk.tzname', null);
+  if (!force && c && c.key === key && c.tz) { locTZ = c.tz; return applyTZ(); }
+  try {
+    const r = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${K.S.lat}&longitude=${K.S.lon}&timezone=auto&forecast_days=1&current=temperature_2m&timeformat=unixtime`);
+    const d = await r.json();
+    if (d && d.timezone && d.timezone !== 'GMT') { locTZ = d.timezone; LS.set('bk.tzname', { key, tz: locTZ }); }
+  } catch (e) { /* dann bleibt die Gerätezeitzone */ }
+  return applyTZ();
+}
 
 /* ---------- Zustand ---------- */
 let view = LS.get('bk.view', 'night');
@@ -896,9 +983,9 @@ function renderNight() {
   else if (e.visible.length) h += `<div style="margin:-6px 0 14px">${bodyChips(n, e, e.status === 'nowx')}</div>`;
 
   /* Achse */
-  const ticks = []; const grid = [];
-  for (let t = Math.ceil(n.start / HOUR) * HOUR; t <= n.end; t += HOUR) {
-    ticks.push(`<span class="tick" style="left:${pct(t)}">${new Date(t).getHours()}</span>`);
+  const ticks = [], grid = [];
+  for (const t of hourTicks(n.start, n.end)) {
+    ticks.push(`<span class="tick" style="left:${pct(t)}">${hourIn(t)}</span>`);
     grid.push(`<div class="grid" style="left:${pct(t)}"></div>`);
   }
   const row = (type, label, svg, cls = '', lblExtra = '') =>
@@ -1096,9 +1183,9 @@ function bodyPop(id, t) {
 
 /* =================== WOCHENANSICHT =================== */
 function relClock(t, k) {
-  const d = new Date(t), d0 = dateOf(k);
-  const dd = Math.round((new Date(d.getFullYear(), d.getMonth(), d.getDate()) - d0) / DAY);
-  return dd * DAY + ((d.getHours() * 60 + d.getMinutes()) * 60 + d.getSeconds()) * 1000 + d.getMilliseconds();
+  const p = tzParts(t), [y, m, d] = k.split('-').map(Number);
+  const dd = Math.round((Date.UTC(p.year, p.month - 1, p.day) - Date.UTC(y, m - 1, d)) / DAY);
+  return dd * DAY + ((p.hour * 60 + p.minute) * 60 + p.second) * 1000;
 }
 function renderWeek() {
   const cur = currentNightKey();
@@ -1123,7 +1210,6 @@ function renderWeek() {
     const cl = svgRects(sampleRuns(n.samples, xOf, (s, i) => { const w = e.flags[i].w; return w ? cloudColor(w.cloud) : COL.nodata; }));
     const gd = svgRects(sampleRuns(n.samples, xOf, (s, i) => { const f = e.flags[i]; if (!f.dark) return null; if (!f.w) return COL.unknown; return f.ok ? COL.good : COL.bad; }));
     let ticks = '';
-    const base = dateOf(n.k).getTime();
     for (let hr = Math.ceil(r0 / HOUR); hr * HOUR <= r1; hr++) {
       if (hr % 2) continue;
       ticks += `<span style="left:${((hr * HOUR - r0) / (r1 - r0) * 100).toFixed(2)}%">${((hr % 24) + 24) % 24}</span>`;
@@ -1135,7 +1221,6 @@ function renderWeek() {
     else if (e.status === 'nowx') body += bodyChips(n, e, true);
     else body += reasonChips(e);
     h += `<div class="card ${cls}" data-k="${n.k}"><div class="date">${fDay(n.k)}<small>${sub}</small></div><div class="body">${body}</div></div>`;
-    void base;
   });
   h += `</div><div class="legend" style="margin-top:12px">
       <span class="it">Streifen: Dämmerung · Bewölkung · Bedingungen</span>
@@ -1157,7 +1242,8 @@ function render() {
   $('#tab-week').classList.toggle('active', view === 'week');
   $('#view-night').hidden = view !== 'night';
   $('#view-week').hidden = view !== 'week';
-  $('#loc-sub').textContent = `${fNum(K.S.lat, 4)}° N, ${fNum(K.S.lon, 4)}° O · Zeiten in Ortszeit`;
+  $('#loc-sub').innerHTML = `${fNum(K.S.lat, 4)}° N, ${fNum(K.S.lon, 4)}° O · Zeiten in <b style="font-weight:500;color:var(--text)">${esc(K.TZ || deviceTZ())}</b>` +
+    (K.TZ && K.TZ !== deviceTZ() ? ` <span title="Die Zeitzone deines Geräts ist eine andere – angezeigt wird die Ortszeit am Beobachtungsort.">(Gerät: ${esc(deviceTZ())})</span>` : '');
   renderWx();
   if (view === 'night') renderNight(); else renderWeek();
 }
@@ -1203,6 +1289,7 @@ function fillSettings() {
   $('#s-lat').value = S.lat; $('#s-lon').value = S.lon;
   $('#s-cloud').value = S.maxCloud; $('#s-prob').value = S.maxProb; $('#s-precip').value = S.maxPrecip;
   $('#s-mingood').value = S.minGood; $('#s-dark').value = String(S.darkLimit); $('#s-minalt').value = S.minAlt;
+  $('#s-tz').value = S.tz || 'auto';
   $('#s-moon').checked = S.moonCounts;
 }
 function readSettings() {
@@ -1213,19 +1300,25 @@ function readSettings() {
     maxCloud: num('#s-cloud', S.maxCloud, 0, 100), maxProb: num('#s-prob', S.maxProb, 0, 100),
     maxPrecip: num('#s-precip', S.maxPrecip, 0.1, 50), minGood: num('#s-mingood', S.minGood, 5, 600),
     darkLimit: parseInt($('#s-dark').value, 10), minAlt: num('#s-minalt', S.minAlt, 0, 60),
-    moonCounts: $('#s-moon').checked,
+    moonCounts: $('#s-moon').checked, tz: $('#s-tz').value,
   };
 }
 function applySettings(s) {
   const loc = setSettings(s);
   LS.set('bk.settings', K.S);
   fillSettings();
-  if (loc) { nightKey = currentNightKey(); weekKey = nightKey; K.WX = null; loadWeather(false); }
+  if (loc) { locTZ = null; K.WX = null; }
+  applyTZ();
+  nightKey = currentNightKey(); weekKey = nightKey;
+  if (loc) { loadTZ(false).then(render); loadWeather(false); }
   render();
 }
 
 function init() {
   setSettings(LS.get('bk.settings', {}));
+  const c = LS.get('bk.tzname', null);
+  if (c && c.key === locKey() && c.tz) locTZ = c.tz;
+  applyTZ();
   nightKey = currentNightKey(); weekKey = nightKey;
   fillSettings();
   $('#tab-night').onclick = () => setView('night');
@@ -1241,6 +1334,7 @@ function init() {
     }, () => { $('#geo-btn').textContent = '📍 Standort nicht verfügbar'; }, { timeout: 10000 });
   };
   render();
+  loadTZ(false).then(changed => { if (changed) { nightKey = currentNightKey(); weekKey = nightKey; render(); } });
   loadWeather(false);
   setInterval(() => { if (pop().hidden) render(); }, 5 * 60 * 1000);
 }
